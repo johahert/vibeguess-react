@@ -48,7 +48,7 @@ export function useAuth() {
     onSuccess: (data) => {
       // Update user query cache with new data
       queryClient.setQueryData(['auth', 'user'], data.user);
-      
+      console.log(data)
       // Invalidate and refetch user data
       queryClient.invalidateQueries({ queryKey: ['auth', 'user'] });
       

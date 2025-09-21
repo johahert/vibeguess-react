@@ -8,6 +8,9 @@ import type {
 
 import { SPOTIFY_SCOPES } from '@/types/auth';
 
+// StoredAuthTokens extends AuthTokens with an absolute expiry timestamp
+export type StoredAuthTokens = AuthTokens & { expires_at?: number };
+
 import { 
   generateCodeChallenge, 
   generateState, 
@@ -27,6 +30,8 @@ class AuthService {
   private baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001/api';
   private clientId = import.meta.env.VITE_SPOTIFY_CLIENT_ID;
   private redirectUri = import.meta.env.VITE_SPOTIFY_REDIRECT_URI || `${window.location.origin}/callback`;
+  // Promise used to dedupe concurrent refresh requests
+  private refreshInFlight: Promise<AuthTokens> | null = null;
 
   constructor() {
     if (!this.clientId) {
@@ -45,28 +50,28 @@ class AuthService {
         return this.mockSpotifyLogin();
       }
 
-      // Generate PKCE parameters
-      const { codeVerifier, codeChallenge } = await generateCodeChallenge();
-      const state = generateState();
-
-      // Store PKCE verifier and state for callback validation
-      storePKCEVerifier(codeVerifier);
-      storeOAuthState(state);
-
-      // Build authorization URL
-      const authURL = buildSpotifyAuthURL({
-        client_id: this.clientId!,
-        response_type: 'code',
-        redirect_uri: this.redirectUri,
-        code_challenge_method: 'S256',
-        code_challenge: codeChallenge,
-        state,
-        scope: SPOTIFY_SCOPES.join(' '),
+      // Ask backend to initiate login. Backend will generate PKCE params and return authorization URL
+      const response = await fetch(`${this.baseURL}/auth/spotify/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ redirectUri: this.redirectUri }),
       });
 
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.message || `Failed to initiate login: ${response.status}`);
+      }
+
+      // Backend returns { authorizationUrl, codeVerifier, state } (see API-Reference)
+      const data = await response.json();
+
+      // Persist PKCE verifier and state locally for callback validation
+      if (data.codeVerifier) storePKCEVerifier(data.codeVerifier);
+      if (data.state) storeOAuthState(data.state);
+
       return {
-        authorization_url: authURL,
-        state,
+        authorization_url: data.authorizationUrl || data.authorization_url,
+        state: data.state,
       };
     } catch (error) {
       console.error('Failed to initiate Spotify login:', error);
@@ -131,44 +136,67 @@ class AuthService {
       if (import.meta.env.DEV && import.meta.env.VITE_ENABLE_MSW === 'true') {
         return this.mockCallbackHandler(code, state);
       }
-
-      // Validate state parameter
+      // Validate state parameter locally (optional; backend should also validate)
       const storedState = retrieveOAuthState();
       if (!storedState || !validateState(state, storedState)) {
         throw new Error('Invalid state parameter - possible CSRF attack');
       }
 
-      // Retrieve PKCE verifier
+      // Retrieve PKCE verifier stored earlier (if backend didn't persist it)
       const codeVerifier = retrievePKCEVerifier();
-      if (!codeVerifier) {
-        throw new Error('Code verifier not found - invalid OAuth flow');
-      }
 
-      // Exchange code for tokens
-      const requestBody: CallbackRequest = { code, state };
-      
+      // Send code + verifier to backend for token exchange
       const response = await fetch(`${this.baseURL}/auth/spotify/callback`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          ...requestBody,
-          code_verifier: codeVerifier,
-          client_id: this.clientId,
-          redirect_uri: this.redirectUri,
+          code,
+          codeVerifier: codeVerifier || undefined,
+          redirectUri: this.redirectUri,
+          state,
         }),
       });
 
+      console.log('Callback response : ', response);
+
       if (!response.ok) {
-        const error = await response.json().catch(() => ({}));
-        throw new Error(error.error_description || `Token exchange failed: ${response.status}`);
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.message || `Token exchange failed: ${response.status}`);
       }
 
-      const tokens: AuthTokens = await response.json();
+      // Backend returns { accessToken, refreshToken, expiresIn, tokenType, user }
+      const data = await response.json();
 
-      // Store tokens securely
+      console.log('Callback data : ', data);
+
+      const tokens: AuthTokens = {
+        access_token: data.accessToken || data.access_token,
+        refresh_token: data.refreshToken || data.refresh_token,
+        expires_in: data.expiresIn || data.expires_in || 3600,
+        token_type: (data.tokenType || data.token_type || 'Bearer') as 'Bearer',
+        scope: data.scope || SPOTIFY_SCOPES.join(' '),
+      };
+
+      console.log('Exchanged tokens : ', tokens);
+
+      // Persist tokens
       this.storeTokens(tokens);
+
+      // Optionally persist user in localStorage for quick access
+      if (data.user){
+          localStorage.setItem('auth_user', JSON.stringify(data.user));
+          console.log('Stored user : ', data.user);
+      }
+
+      // Attempt to fetch current user from backend to validate tokens. If this fails,
+      // clear tokens and surface an error so the caller can redirect to login.
+      try {
+        await this.getCurrentUser();
+      } catch (meErr) {
+        console.warn('getCurrentUser failed after callback exchange:', meErr);
+        this.clearTokens();
+        throw new Error('Failed to validate user after token exchange');
+      }
 
       return tokens;
     } catch (error) {
@@ -186,33 +214,42 @@ class AuthService {
       if (!currentTokens?.refresh_token) {
         throw new Error('No refresh token available');
       }
-
-      const requestBody: TokenRefreshRequest = {
-        refresh_token: currentTokens.refresh_token,
-      };
-
-      const response = await fetch(`${this.baseURL}/auth/spotify/refresh`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          ...requestBody,
-          client_id: this.clientId,
-        }),
-      });
-
-      if (!response.ok) {
-        const error = await response.json().catch(() => ({}));
-        throw new Error(error.error_description || `Token refresh failed: ${response.status}`);
+      // If a refresh is already in-flight, reuse it
+      if (this.refreshInFlight) {
+        return this.refreshInFlight;
       }
 
-      const newTokens: AuthTokens = await response.json();
+      this.refreshInFlight = (async () => {
+        const response = await fetch(`${this.baseURL}/auth/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refreshToken: currentTokens.refresh_token }),
+        });
 
-      // Store new tokens
-      this.storeTokens(newTokens);
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({}));
+          throw new Error(err.message || `Token refresh failed: ${response.status}`);
+        }
 
-      return newTokens;
+        const data = await response.json();
+
+        const newTokens: AuthTokens = {
+          access_token: data.accessToken || data.access_token,
+          refresh_token: data.refreshToken || data.refresh_token || currentTokens.refresh_token,
+          expires_in: data.expiresIn || data.expires_in || 3600,
+          token_type: (data.tokenType || data.token_type || 'Bearer') as 'Bearer',
+          scope: data.scope || currentTokens.scope || SPOTIFY_SCOPES.join(' '),
+        };
+
+        // Store new tokens
+        this.storeTokens(newTokens);
+
+        // clear in-flight ref
+        this.refreshInFlight = null;
+        return newTokens;
+      })();
+
+      return this.refreshInFlight;
     } catch (error) {
       console.error('Token refresh failed:', error);
       // Clear invalid tokens
@@ -224,31 +261,46 @@ class AuthService {
   /**
    * Get current user profile from Spotify API
    */
-  async getCurrentUser(): Promise<SpotifyUser> {
+  /**
+   * Get current user profile from backend. Will attempt a single refresh on 401 and will not loop.
+   * @param attemptRefresh whether to attempt a refresh when receiving 401 (default true)
+   */
+  async getCurrentUser(attemptRefresh = true): Promise<SpotifyUser> {
     try {
-      const tokens = this.getStoredTokens();
+        const tokens = this.getStoredTokens();
+        console.log('Getting current user with tokens: ', tokens);
       if (!tokens?.access_token) {
         throw new Error('No access token available');
       }
 
-      const response = await fetch('https://api.spotify.com/v1/me', {
+      const response = await fetch(`${this.baseURL}/auth/me`, {
         headers: {
-          'Authorization': `Bearer ${tokens.access_token}`,
-          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tokens.access_token}`,
         },
       });
 
       if (response.status === 401) {
-        // Token expired, try to refresh
-        await this.refreshToken();
-        return this.getCurrentUser(); // Retry with new token
+        if (attemptRefresh) {
+          try {
+            await this.refreshToken();
+            // Retry once but do not attempt further refreshes to avoid loops
+            return this.getCurrentUser(false);
+          } catch (refreshErr) {
+            // Refresh failed - propagate original 401
+            throw new Error('Unauthorized and refresh failed');
+          }
+        }
+
+        throw new Error('Unauthorized');
       }
 
       if (!response.ok) {
-        throw new Error(`Failed to get user profile: ${response.status}`);
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.message || `Failed to get user profile: ${response.status}`);
       }
 
-      const user: SpotifyUser = await response.json();
+      const result = await response.json();
+      const user: SpotifyUser = result.user || result;
       return user;
     } catch (error) {
       console.error('Failed to get current user:', error);
@@ -292,8 +344,8 @@ class AuthService {
     try {
       const tokensStr = localStorage.getItem('auth_tokens');
       if (!tokensStr) return null;
-      
-      return JSON.parse(tokensStr);
+      const parsed = JSON.parse(tokensStr) as StoredAuthTokens;
+      return parsed;
     } catch (error) {
       console.error('Failed to parse stored tokens:', error);
       this.clearTokens();
@@ -307,8 +359,19 @@ class AuthService {
    */
   private storeTokens(tokens: AuthTokens): void {
     try {
+      // compute absolute expiry time (expires_at) in ms since epoch
+      const now = Date.now();
+      const expiresIn = tokens.expires_in || 3600;
+      const expires_at = now + expiresIn * 1000;
+
+      const stored: StoredAuthTokens = {
+        ...tokens,
+        expires_in: expiresIn,
+        expires_at,
+      };
+
       // In production, consider encrypting tokens before storage
-      localStorage.setItem('auth_tokens', JSON.stringify(tokens));
+      localStorage.setItem('auth_tokens', JSON.stringify(stored));
     } catch (error) {
       console.error('Failed to store tokens:', error);
       throw new Error('Failed to store authentication tokens');

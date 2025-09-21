@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { devtools, persist } from 'zustand/middleware';
 import type { AuthTokens, SpotifyUser, AuthState } from '@/types/auth';
+import type { StoredAuthTokens } from '@/services/auth.service';
 import authService from '@/services/auth.service';
 
 /**
@@ -27,12 +28,15 @@ interface AuthStore extends AuthState {
  */
 function isTokenExpired(tokens: AuthTokens | null): boolean {
   if (!tokens) return true;
-  
-  // Calculate expiry time (tokens.expires_in is in seconds)
-  const expiryTime = Date.now() + (tokens.expires_in * 1000);
-  const fiveMinutesFromNow = Date.now() + (5 * 60 * 1000);
-  
-  return expiryTime <= fiveMinutesFromNow;
+  // If tokens is actually StoredAuthTokens and has expires_at, compare against it
+  const maybeStored = tokens as StoredAuthTokens;
+  if (maybeStored.expires_at && typeof maybeStored.expires_at === 'number') {
+    const fiveMinutesFromNow = Date.now() + 5 * 60 * 1000;
+    return maybeStored.expires_at <= fiveMinutesFromNow;
+  }
+
+  // If we don't have an absolute expiry, conservatively treat as expired to trigger refresh flow
+  return true;
 }
 
 export const useAuthStore = create<AuthStore>()(
@@ -135,10 +139,28 @@ export const useAuthStore = create<AuthStore>()(
             }
 
             // Get user profile
-            const user = await authService.getCurrentUser();
-            setUser(user);
-            setLoading(false);
-            return { success: true, user };
+            try {
+              const user = await authService.getCurrentUser();
+              setUser(user);
+              setLoading(false);
+              return { success: true, user };
+            } catch (meError) {
+              // If fetching the current user fails (even after attempted refresh), clear auth and redirect to login
+              console.warn('Failed to fetch current user during auth initialize:', meError);
+              try {
+                authService.logout();
+              } catch (e) {
+                console.error('Error during logout after failed /me:', e);
+              }
+              setLoading(false);
+              // Redirect to login to restart the flow and avoid repeated failing requests
+              try {
+                window.location.replace('/login');
+              } catch (e) {
+                // Ignore if window not available in test env
+              }
+              return { success: false, reason: 'me_failed', error: meError };
+            }
 
           } catch (error) {
             console.error('Auth initialization failed:', error);
